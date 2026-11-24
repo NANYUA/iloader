@@ -19,71 +19,28 @@ on:
       - "**"
   workflow_dispatch:
     inputs:
-      platforms:
-        description: "Which platforms to build"
-        type: choice
-        default: "windows"
-        options:
-          - "windows"
-          - "windows,linux,macos"
-      tauri_args:
-        description: "Extra tauri build args (leave empty for defaults)"
-        type: string
-        default: ""
+      build_linux:
+        description: "Also build Linux"
+        type: boolean
+        default: false
+      build_macos:
+        description: "Also build macOS"
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: "windows-latest"
-            label: "windows-x64"
-            args: ""
-          - platform: "ubuntu-22.04"
-            label: "linux-x64"
-            args: "--bundles deb,appimage"
-          - platform: "macos-latest"
-            label: "macos-universal"
-            args: "--target universal-apple-darwin"
-
-    runs-on: ${{ matrix.platform }}
-
+  # Windows always builds. It is the target this fork actually needs, and it is
+  # the cheapest of the three runners.
+  windows:
+    runs-on: windows-latest
     steps:
-      # Windows is always built on push. Linux/macOS are opt-in through
-      # workflow_dispatch so a normal push stays cheap.
-      - name: Decide whether to run this matrix entry
-        id: gate
-        shell: bash
-        run: |
-          set -euo pipefail
-          requested="${{ github.event.inputs.platforms }}"
-          if [ -z "$requested" ]; then
-            requested="windows"
-          fi
-          case "${{ matrix.label }}" in
-            windows-*) want="windows" ;;
-            linux-*)   want="linux" ;;
-            macos-*)   want="macos" ;;
-            *)         want="unknown" ;;
-          esac
-          if [ "$requested" = "windows,linux,macos" ] || [ "$requested" = "$want" ]; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
-            echo "Building ${{ matrix.label }}"
-          else
-            echo "run=false" >> "$GITHUB_OUTPUT"
-            echo "Skipping ${{ matrix.label }} (requested: $requested)"
-          fi
-
       - uses: actions/checkout@v6
-        if: steps.gate.outputs.run == 'true'
 
       - name: Cache cargo and node modules
-        if: steps.gate.outputs.run == 'true'
         uses: actions/cache@v5
         with:
           path: |
@@ -91,18 +48,68 @@ jobs:
             ~/.cargo/git
             src-tauri/target
             node_modules
-          key: fork-${{ matrix.label }}-${{ hashFiles('**/Cargo.lock', 'bun.lock') }}
+          key: fork-windows-${{ hashFiles('**/Cargo.lock', 'bun.lock') }}
           restore-keys: |
-            fork-${{ matrix.label }}-
+            fork-windows-
 
       - name: Install Rust stable
-        if: steps.gate.outputs.run == 'true'
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+
+      # Some native crates shell out to perl/make on Windows, and neither is
+      # guaranteed to be on PATH on the runner.
+      - name: Install Perl and Make
+        run: choco install strawberryperl make --no-progress -y
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
         with:
-          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+          bun-version: latest
+
+      - name: Install frontend dependencies
+        run: bun i --frozen-lockfile
+
+      - name: Clear stale bundles
+        shell: bash
+        run: rm -rf src-tauri/target/release/bundle
+
+      - name: Build with Tauri
+        uses: tauri-apps/tauri-action@v0
+        with:
+          # ci.conf.json removes the updater signing requirement.
+          args: --config src-tauri/ci.conf.json
+
+      - name: Collect artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find src-tauri/target -type f \
+            \( -name "*.exe" -o -name "*.msi" \) \
+            -not -path "*/deps/*" -not -path "*/build/*" \
+            -exec cp -v {} dist/ \; || true
+          ls -la dist
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: iloader-fixed-windows-x64
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+  # Separate jobs so the runners are only allocated when actually requested.
+  # The previous single-matrix version still queued macOS/Linux and then
+  # skipped every step inside them, which held a runner slot for nothing.
+  linux:
+    if: github.event_name == 'workflow_dispatch' && inputs.build_linux
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
 
       - name: Install Linux system dependencies
-        if: steps.gate.outputs.run == 'true' && startsWith(matrix.platform, 'ubuntu')
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -112,97 +119,71 @@ jobs:
             patchelf \
             xdg-utils
 
-      - name: Set up MSVC environment
-        if: steps.gate.outputs.run == 'true' && matrix.platform == 'windows-latest'
-        uses: ilammy/msvc-dev-cmd@v1
-
-      # Matches the upstream workflow: some native crates shell out to perl/make
-      # on Windows, and neither is guaranteed to be on PATH on the runner.
-      - name: Install Perl and Make (Windows)
-        if: steps.gate.outputs.run == 'true' && matrix.platform == 'windows-latest'
-        run: choco install strawberryperl make --no-progress -y
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Set up Bun
-        if: steps.gate.outputs.run == 'true'
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
 
       - name: Install frontend dependencies
-        if: steps.gate.outputs.run == 'true'
         run: bun i --frozen-lockfile
 
-      - name: Clear stale bundles
-        if: steps.gate.outputs.run == 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-          rm -rf src-tauri/target/release/bundle
-          rm -rf src-tauri/target/universal-apple-darwin/release/bundle
-
       - name: Build with Tauri
-        if: steps.gate.outputs.run == 'true'
         uses: tauri-apps/tauri-action@v0
         with:
-          # ci.conf.json removes the updater signing requirement.
-          args: >-
-            ${{ matrix.args }}
-            --config src-tauri/ci.conf.json
-            ${{ github.event.inputs.tauri_args }}
+          args: --bundles deb,appimage --config src-tauri/ci.conf.json
 
       - name: Collect artifacts
-        if: steps.gate.outputs.run == 'true'
-        shell: bash
         run: |
-          set -euo pipefail
           mkdir -p dist
-          find src-tauri/target -type f \
-            \( -name "*.exe" -o -name "*.msi" -o -name "*.deb" \
-               -o -name "*.AppImage" -o -name "*.dmg" \) \
-            -not -path "*/deps/*" -not -path "*/build/*" \
+          find src-tauri/target -type f \( -name "*.deb" -o -name "*.AppImage" \) \
             -exec cp -v {} dist/ \; || true
-          echo "--- collected ---"
-          ls -la dist || true
+          ls -la dist
 
       - name: Upload artifacts
-        if: steps.gate.outputs.run == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: iloader-fixed-${{ matrix.label }}
+          name: iloader-fixed-linux-x64
           path: dist/*
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 30
 
-  # Runs once, after every requested platform finished, and publishes the
-  # Windows binaries to a GitHub Release so they are easy to download.
-  release:
-    needs: build
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
+  macos:
+    if: github.event_name == 'workflow_dispatch' && inputs.build_macos
+    runs-on: macos-latest
     steps:
-      - uses: actions/download-artifact@v5
+      - uses: actions/checkout@v6
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
         with:
-          path: artifacts
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
 
-      - name: List downloaded artifacts
-        run: find artifacts -type f | head -50
-
-      - name: Publish release
-        uses: softprops/action-gh-release@v2
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
         with:
-          tag_name: build-${{ github.run_number }}
-          name: "Fixed build ${{ github.run_number }}"
-          body: |
-            Automated build of the login fix.
+          bun-version: latest
 
-            Source: commit ${{ github.sha }}
-            Change: `src-tauri/src/account.rs` — current `Mac OS X` client identity
-            instead of the macOS 10.12.6 one.
+      - name: Install frontend dependencies
+        run: bun i --frozen-lockfile
 
-            **After installing, use "Reset Anisette State" once before logging in.**
-            Anisette state provisioned under the old identity causes `-22410`.
-          files: artifacts/**/*
-          draft: false
-          prerelease: true
+      - name: Build with Tauri
+        uses: tauri-apps/tauri-action@v0
+        with:
+          args: --target universal-apple-darwin --config src-tauri/ci.conf.json
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p dist
+          find src-tauri/target -type f -name "*.dmg" -exec cp -v {} dist/ \; || true
+          ls -la dist
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: iloader-fixed-macos-universal
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
