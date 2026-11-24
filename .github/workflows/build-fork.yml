@@ -89,10 +89,16 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          find src-tauri/target -type f \
+          # Restrict to the bundle output; a bare find over src-tauri/target
+          # also picks up frontend assets (index.html, *.svg) that Tauri
+          # copies into target/release, and those do not belong in a release.
+          find src-tauri/target/release/bundle -type f \
             \( -name "*.exe" -o -name "*.msi" \) \
-            -not -path "*/deps/*" -not -path "*/build/*" \
-            -exec cp -v {} dist/ \; || true
+            -exec cp -v {} dist/ \;
+          # The portable single-file build lives next to the bundle dir.
+          if [ -f src-tauri/target/release/iloader.exe ]; then
+            cp -v src-tauri/target/release/iloader.exe dist/
+          fi
           ls -la dist
 
       - name: Upload artifacts
