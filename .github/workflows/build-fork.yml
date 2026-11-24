@@ -32,6 +32,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: write
+
 jobs:
   # Windows always builds. It is the target this fork actually needs, and it is
   # the cheapest of the three runners.
@@ -187,3 +190,40 @@ jobs:
           path: dist/*
           if-no-files-found: error
           retention-days: 30
+
+  # Publishes the Windows binaries as a Release so they can be downloaded
+  # without digging through the Actions run page. Tag is build-<run number>,
+  # marked prerelease because this fork is not the official project.
+  release:
+    needs: windows
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          name: iloader-fixed-windows-x64
+          path: release-assets
+
+      - name: List assets
+        run: ls -la release-assets
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: "iloader 修复版 build ${{ github.run_number }}"
+          body: |
+            自动构建的 iloader 修复版（登录问题）。
+
+            提交：`${{ github.sha }}`
+
+            **修改内容**：`src-tauri/src/account.rs` 改用当前的 `Mac OS X` 身份字符串，
+            不再使用 macOS 10.12.6 的旧身份。
+
+            **安装后必须先点一次 Settings → Reset Anisette State 再登录**，
+            否则会在 2FA 之后报 `-22410`。
+
+            详细说明见 [README](https://github.com/NANYUA/iloader#readme)。
+          files: release-assets/*
+          draft: false
+          prerelease: true
